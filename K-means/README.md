@@ -1,5 +1,11 @@
 # K-means — primeira exploração
 
+**Versão principal adotada:** K=32, P95, janela de 6h, excedências de 25% e recuperação de 6h, com avisos agrupados e estado entre blocos. Guia em [DETECCAO_E_ALERTAS.md](DETECCAO_E_ALERTAS.md); modelos em [outputs/detection_balanced/](outputs/detection_balanced/). O comando principal `failure_alerts.py train` usa esse perfil por padrão. As seções seguintes registram experimentos históricos.
+
+Fluxo que prioriza detecção com controle de episódios e avisos repetidos: [DETECCAO_E_ALERTAS.md](DETECCAO_E_ALERTAS.md). Inclui estado entre blocos e comparação de regras por sensibilidade e carga de notificações.
+
+**Resumo atualizado incluindo o estudo com agentes:** [REVISAO_ATUAL.md](REVISAO_ATUAL.md). O melhor equilíbrio medido nos mesmos 30 eventos reservados continua sendo K64/P99/6h (46,7% de acurácia balanceada); o novo fluxo K32 reproduziu 43,3%, com mais detecção e mais falsos alertas.
+
 Fluxo executável para **treinar, salvar e reutilizar um detector de anomalias**: [ALERTAS.md](ALERTAS.md). Inclui comandos PowerShell, interpretação dos alertas e testes. É um baseline experimental; o desempenho anterior ainda não sustenta previsão confiável de falhas.
 
 Busca posterior de **108 configurações, incluindo K=3**: protocolo, comandos e resultados em [BUSCA_CONFIGURACOES.md](BUSCA_CONFIGURACOES.md). A configuração escolhida alcançou 46,7% de sensibilidade e 46,7% de especificidade em 30 eventos reservados por turbina; a grade não resolveu o problema de generalização.

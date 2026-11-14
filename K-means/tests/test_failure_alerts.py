@@ -1,5 +1,6 @@
 """Checks for leakage, persistence, missing data and model reuse."""
 import sys
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,7 +11,7 @@ import pandas as pd
 from threadpoolctl import threadpool_limits
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from failure_alerts import predict, train
+from failure_alerts import apply_alarm_rule, predict, predict_stream, train
 
 
 class DetectorTests(unittest.TestCase):
@@ -25,14 +26,14 @@ class DetectorTests(unittest.TestCase):
         })
         self.features = ["sensor_a_avg", "sensor_b_avg"]
         with threadpool_limits(limits=1):
-            self.bundle = train(self.frame, "A", self.features, k=3)
+            self.bundle = train(self.frame, "A", self.features, k=3, hours=24)
         self.pred = self.frame.iloc[1700:].copy()
 
     def test_prediction_values_do_not_change_training(self):
         changed = self.frame.copy()
         changed.loc[1700:, self.features] = 1e9
         with threadpool_limits(limits=1):
-            other = train(changed, "A", self.features, k=3)
+            other = train(changed, "A", self.features, k=3, hours=24)
         np.testing.assert_array_equal(self.bundle["model"].cluster_centers_, other["model"].cluster_centers_)
         self.assertEqual(self.bundle["threshold"], other["threshold"])
         gap = (pd.Timestamp(self.bundle["calibration_start"]).to_pydatetime()
@@ -77,6 +78,53 @@ class DetectorTests(unittest.TestCase):
         self.assertFalse(scores.eligible.any())
         with self.assertRaisesRegex(ValueError, "10 minutos"):
             predict(self.bundle, self.pred.assign(time_stamp=pd.date_range("2025-01-01", periods=300, freq="1min")), "A")
+
+    def test_stricter_fraction_removes_intermittent_alerts(self):
+        scores = pd.DataFrame({"time_stamp": self.pred.time_stamp.to_numpy(),
+                               "eligible": True,
+                               "score": np.where(np.arange(len(self.pred)) % 5 < 2, 2., 0.)})
+        loose = apply_alarm_rule(scores, 1., 24, .25)
+        strict = apply_alarm_rule(scores, 1., 24, .5)
+        self.assertTrue(loose.alarm.any())
+        self.assertFalse(strict.alarm.any())
+        self.assertFalse((strict.alarm & ~loose.alarm).any())
+
+    def test_configurable_training_retains_centers(self):
+        with threadpool_limits(limits=1):
+            strict = train(self.frame, "A", self.features, k=3, quantile=.99,
+                           hours=48, alarm_fraction=.5)
+        np.testing.assert_array_equal(self.bundle["model"].cluster_centers_, strict["model"].cluster_centers_)
+        self.assertGreaterEqual(strict["threshold"], self.bundle["threshold"])
+        self.pred[self.features] = 1000.
+        scores = predict(strict, self.pred, "A")
+        self.assertFalse(scores.alarm.iloc[:143].any())
+        self.assertTrue(scores.alarm.iloc[143:].all())
+        with self.assertRaises(ValueError):
+            train(self.frame, "A", self.features, quantile=1.)
+
+    def test_primary_profile_defaults_to_six_hour_detection(self):
+        with threadpool_limits(limits=1):
+            primary = train(self.frame, "A", self.features, k=3)
+        self.assertEqual(primary["hours"], 6)
+        self.assertEqual(primary["threshold_quantile"], .95)
+        self.assertEqual(primary["alarm_fraction"], .25)
+        self.assertEqual(primary["recovery_hours"], 6)
+        self.pred[self.features] = 1000.
+        scores = predict(primary, self.pred, "A")
+        self.assertFalse(scores.alarm.iloc[:17].any())
+        self.assertTrue(scores.alarm.iloc[17:].all())
+
+    def test_streaming_context_matches_single_batch_without_duplicate_notice(self):
+        self.pred[self.features] = 1000.
+        full = predict(self.bundle, self.pred, "A")
+        first, state = predict_stream(self.bundle, self.pred.iloc[:100], "A")
+        state = json.loads(json.dumps(state, allow_nan=False))
+        second, _ = predict_stream(self.bundle, self.pred.iloc[100:], "A", state)
+        pd.testing.assert_frame_equal(full, pd.concat([first, second], ignore_index=True))
+        self.assertEqual(full.notification.sum(), 1)
+        self.assertEqual(second.notification.sum(), 0)
+        with self.assertRaisesRegex(ValueError, "sem repetir"):
+            predict_stream(self.bundle, self.pred.iloc[:100], "A", state)
 
 
 if __name__ == "__main__":

@@ -137,7 +137,8 @@ def main():
             features = candidate_features(header, path.parent.parent / "feature_description.csv")
             frame = pd.read_csv(path, sep=";", usecols=features + [
                 "time_stamp", "asset_id", "id", "status_type_id", "train_test"])
-            bundle = train(frame, entry.farm, features)
+            # Preserve the historical baseline when the main profile changes.
+            bundle = train(frame, entry.farm, features, hours=24)
             if bundle["asset_id"] != entry.asset:
                 raise ValueError("Identidade da turbina difere do manifesto.")
             _, prediction = split_rows(frame)

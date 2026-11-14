@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -15,6 +16,9 @@ from threadpoolctl import threadpool_limits
 
 from kmeans_baseline import MODEL_ROOT, PROJECT_ROOT, choose_file, split_rows
 from shared_reference import candidate_features
+from alert_episodes import group_alerts
+
+PRIMARY_HOURS = 6
 
 
 def validate(frame: pd.DataFrame) -> pd.DataFrame:
@@ -39,7 +43,12 @@ def numeric(frame, features):
     )
 
 
-def train(frame: pd.DataFrame, farm: str, features: list[str], *, k=32, seed=42):
+def train(frame: pd.DataFrame, farm: str, features: list[str], *, k=32, seed=42,
+          quantile=.95, hours=PRIMARY_HOURS, alarm_fraction=.25, recovery_hours=6):
+    if not .5 < quantile < 1 or hours < 1 or int(hours) != hours or not 0 < alarm_fraction <= 1:
+        raise ValueError("Use .5 < quantile < 1, horas inteiras >= 1 e 0 < alarm_fraction <= 1.")
+    if recovery_hours <= 0 or recovery_hours * 6 != int(recovery_hours * 6):
+        raise ValueError("A recuperação deve ser positiva e múltipla de 10 minutos.")
     frame = validate(frame)
     train_mask, pred_mask = split_rows(frame)
     if not pred_mask.any() or not train_mask.any():
@@ -71,16 +80,17 @@ def train(frame: pd.DataFrame, farm: str, features: list[str], *, k=32, seed=42)
     if len(cal_values) < 20:
         raise ValueError("Poucas linhas de calibração com sensores suficientes.")
     xc = scaler.transform(imputer.transform(cal_values))
-    threshold = float(np.quantile(model.transform(xc).min(axis=1), .95))
+    threshold = float(np.quantile(model.transform(xc).min(axis=1), quantile))
     return dict(version=1, farm=farm, asset_id=str(frame.asset_id.iloc[0]),
                 features=selected, imputer=imputer, scaler=scaler, model=model,
-                threshold=threshold, hours=24, alarm_fraction=.25, max_missing=.3,
+                threshold=threshold, threshold_quantile=quantile, hours=hours,
+                alarm_fraction=alarm_fraction, max_missing=.3, recovery_hours=recovery_hours,
                 training_end=str(frame.loc[train_mask, "time_stamp"].max()),
                 fit_rows=len(fit), calibration_rows=len(cal_values), seed=seed,
                 calibration_start=str(cal_start), fit_end=str(fit.time_stamp.max()))
 
 
-def predict(bundle: dict, frame: pd.DataFrame, farm: str) -> pd.DataFrame:
+def score_rows(bundle: dict, frame: pd.DataFrame, farm: str) -> pd.DataFrame:
     frame = validate(frame)
     if farm != bundle["farm"] or str(frame.asset_id.iloc[0]) != bundle["asset_id"]:
         raise ValueError("O modelo só pode ser usado na mesma fazenda e turbina de treino.")
@@ -105,14 +115,51 @@ def predict(bundle: dict, frame: pd.DataFrame, farm: str) -> pd.DataFrame:
         x = bundle["scaler"].transform(bundle["imputer"].transform(values.loc[eligible]))
         result.loc[eligible, "cluster"] = bundle["model"].predict(x)
         result.loc[eligible, "score"] = bundle["model"].transform(x).min(axis=1)
-    result["threshold"] = bundle["threshold"]
-    result["exceedance"] = eligible & result.score.gt(bundle["threshold"])
+    return result
+
+
+def predict_stream(bundle, frame, farm, state=None):
+    """Carry the rolling context and incident lifecycle across nonoverlapping blocks."""
+    fresh = score_rows(bundle, frame, farm)
+    state = state or {}
+    context = pd.DataFrame(state.get("context", []), columns=["time_stamp", "eligible", "score"])
+    if len(context):
+        context.time_stamp = pd.to_datetime(context.time_stamp)
+        if context.time_stamp.max() >= fresh.time_stamp.min():
+            raise ValueError("O estado exige blocos novos, sem repetir registros anteriores.")
+        values = pd.concat([context, fresh[["time_stamp", "eligible", "score"]]], ignore_index=True)
+    else:
+        values = fresh[["time_stamp", "eligible", "score"]].copy()
+    ruled = apply_alarm_rule(values, bundle["threshold"], bundle["hours"], bundle["alarm_fraction"])
+    for column in ["threshold", "exceedance", "rolling_exceedance_fraction", "alarm"]:
+        fresh[column] = ruled[column].iloc[-len(fresh):].to_numpy()
+    result, episode_state = group_alerts(fresh, bundle.get("recovery_hours", 6), state.get("episode"))
+    cutoff_ns = values.time_stamp.max().value - int(bundle["hours"]) * 3_600_000_000_000
+    retained = values.loc[values.time_stamp.to_numpy(dtype="datetime64[ns]").astype(np.int64) > cutoff_ns]
+    context_rows = [dict(time_stamp=row.time_stamp.isoformat(), eligible=bool(row.eligible),
+                         score=float(row.score) if pd.notna(row.score) else None)
+                    for row in retained.itertuples()]
+    return result, dict(episode=episode_state, context=context_rows)
+
+
+def predict(bundle: dict, frame: pd.DataFrame, farm: str) -> pd.DataFrame:
+    return predict_stream(bundle, frame, farm)[0]
+
+
+def apply_alarm_rule(scores, threshold, hours, alarm_fraction):
+    """Reuse fixed sensor scores while changing a causal alarm rule."""
+    if hours < 1 or int(hours) != hours or not 0 < alarm_fraction <= 1:
+        raise ValueError("Horas inteiras >= 1 e 0 < alarm_fraction <= 1 são obrigatórios.")
+    result = scores.copy()
+    eligible = result.eligible
+    result["threshold"] = threshold
+    result["exceedance"] = eligible & result.score.gt(threshold)
     signal = pd.Series(np.where(eligible, result.exceedance.astype(float), np.nan),
-                       index=pd.DatetimeIndex(frame.time_stamp))
-    # At 10-minute cadence, half of the expected daily records must be eligible.
-    rolling = signal.rolling(f"{bundle['hours']}h", min_periods=bundle["hours"] * 3).mean()
+                       index=pd.DatetimeIndex(result.time_stamp))
+    # At 10-minute cadence, half of the expected records must be eligible.
+    rolling = signal.rolling(f"{hours}h", min_periods=int(hours) * 3).mean()
     result["rolling_exceedance_fraction"] = rolling.to_numpy()
-    result["alarm"] = eligible & result.rolling_exceedance_fraction.ge(bundle["alarm_fraction"])
+    result["alarm"] = eligible & result.rolling_exceedance_fraction.ge(alarm_fraction)
     return result
 
 
@@ -122,9 +169,15 @@ def save_report(bundle, scores, output, metadata=None):
         "fit_rows", "calibration_rows", "training_end", "calibration_start", "fit_end", "seed"
     )}
     report.update(k=int(bundle["model"].n_clusters), prediction_rows=len(scores),
+                  threshold_quantile=bundle.get("threshold_quantile", .95),
                   eligible_rows=int(scores.eligible.sum()), alarm_rows=int(scores.alarm.sum()),
                   first_alarm=str(scores.loc[scores.alarm, "time_stamp"].min()) if scores.alarm.any() else None,
                   note="Alerta de anomalia experimental; não estima probabilidade, causa ou data de falha.")
+    if "notification" in scores:
+        report.update(notification_count=int(scores.notification.sum()),
+                      recovery_hours=bundle.get("recovery_hours", 6),
+                      active_incident_rows=int(scores.incident_active.sum()),
+                      selection_accepted=bundle.get("selection_accepted"))
     if metadata is not None:
         anomaly = metadata.event_label == "anomaly"
         window = scores.time_stamp.between(pd.Timestamp(metadata.event_start), pd.Timestamp(metadata.event_end))
@@ -134,6 +187,8 @@ def save_report(bundle, scores, output, metadata=None):
             false_alarm_in_prediction=bool(scores.alarm.any()) if not anomaly else None,
             note="Avaliação de um evento; não é a métrica CARE oficial nem validação de generalização.",
         )
+        if "notification" in scores:
+            report["event_evaluation"]["new_notification_in_annotated_window"] = bool((scores.notification & window).any()) if anomaly else None
     (output / "report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
@@ -145,11 +200,16 @@ def main():
     fit_parser.add_argument("--farm", choices=list("ABC"), required=True)
     fit_parser.add_argument("--event-id", required=True)
     fit_parser.add_argument("--output-dir", type=Path, required=True)
+    fit_parser.add_argument("--quantile", type=float, default=.95)
+    fit_parser.add_argument("--hours", type=int, default=PRIMARY_HOURS)
+    fit_parser.add_argument("--alarm-fraction", type=float, default=.25)
+    fit_parser.add_argument("--recovery-hours", type=float, default=6)
     score_parser = commands.add_parser("predict", help="Aplicar modelo salvo em novo CSV com separador ;")
     score_parser.add_argument("--model", type=Path, required=True)
     score_parser.add_argument("--csv", type=Path, required=True)
     score_parser.add_argument("--farm", choices=list("ABC"), required=True)
     score_parser.add_argument("--output-dir", type=Path, required=True)
+    score_parser.add_argument("--state-file", type=Path, help="Persistir janela e episódios entre blocos novos")
     args = parser.parse_args()
     try:
         metadata = None
@@ -159,7 +219,8 @@ def main():
             features = candidate_features(header, path.parent.parent / "feature_description.csv")
             frame = pd.read_csv(path, sep=";", usecols=features + [
                 "time_stamp", "asset_id", "id", "status_type_id", "train_test"])
-            bundle = train(frame, args.farm, features)
+            bundle = train(frame, args.farm, features, quantile=args.quantile,
+                           hours=args.hours, alarm_fraction=args.alarm_fraction, recovery_hours=args.recovery_hours)
             _, prediction = split_rows(frame)
             scores = predict(bundle, frame.loc[prediction], args.farm)
             info = pd.read_csv(path.parent.parent / "event_info.csv", sep=";")
@@ -172,13 +233,27 @@ def main():
                 frame = frame.loc[prediction]
             if frame.empty:
                 raise ValueError("CSV sem linhas de previsão.")
-            scores = predict(bundle, frame, args.farm)
+            model_hash = hashlib.sha256(args.model.read_bytes()).hexdigest()
+            state = None
+            if args.state_file and args.state_file.exists():
+                state = json.loads(args.state_file.read_text(encoding="utf-8"))
+                if state.pop("model_sha256", None) != model_hash:
+                    raise ValueError("O arquivo de estado pertence a outro modelo; use outro state-file.")
+            scores, next_state = predict_stream(bundle, frame, args.farm, state)
         args.output_dir.mkdir(parents=True, exist_ok=True)
         if args.command == "train":
             joblib.dump(bundle, args.output_dir / "model.joblib")
         scores.to_csv(args.output_dir / "predictions.csv", index=False)
+        scores.loc[scores.notification].to_csv(args.output_dir / "notifications.csv", index=False)
         save_report(bundle, scores, args.output_dir, metadata)
-        print(f"Saída: {args.output_dir}\nRegistros com alerta: {int(scores.alarm.sum())}/{len(scores)}")
+        if args.command == "predict" and args.state_file:
+            next_state["model_sha256"] = model_hash
+            args.state_file.parent.mkdir(parents=True, exist_ok=True)
+            temporary = args.state_file.with_suffix(args.state_file.suffix + ".tmp")
+            temporary.write_text(json.dumps(next_state, allow_nan=False, indent=2), encoding="utf-8")
+            temporary.replace(args.state_file)
+        print(f"Saída: {args.output_dir}\nNovos avisos: {int(scores.notification.sum())}"
+              f"\nRegistros em alarme (não são avisos repetidos): {int(scores.alarm.sum())}/{len(scores)}")
     except (ValueError, KeyError, FileNotFoundError) as exc:
         parser.exit(1, f"Erro: {exc}\n")
 
