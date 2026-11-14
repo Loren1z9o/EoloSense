@@ -21,6 +21,8 @@ from sklearn.preprocessing import StandardScaler
 
 
 EXCLUDE = {"id", "asset_id", "time_stamp", "train_test", "status_type_id", "status_type"}
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MODEL_ROOT = Path(__file__).resolve().parents[1]
 
 
 def event_files(root: Path) -> list[Path]:
@@ -173,6 +175,11 @@ def run(args: argparse.Namespace) -> None:
 
     n_train = save_assignments(normal_mask, "train_clusters.csv")
     n_prediction = save_assignments(prediction_mask, "prediction_clusters.csv")
+    train_labels = pd.read_csv(output / "train_clusters.csv", usecols=["cluster"])["cluster"]
+    train_values = numeric.loc[normal_mask, chosen].reset_index(drop=True)
+    profile = train_values.groupby(train_labels).mean()
+    profile.insert(0, "rows", train_labels.value_counts().sort_index())
+    profile.to_csv(output / "cluster_profile.csv", index_label="cluster")
     report = {
         "source": str(path), "farm": args.farm, "event_id": path.stem,
         "rows_total": len(frame), "rows_train_normal": n_train,
@@ -190,8 +197,8 @@ def run(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/kmeans"))
+    parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data")
+    parser.add_argument("--output-dir", type=Path, default=MODEL_ROOT / "outputs/kmeans")
     parser.add_argument("--farm", choices=["A", "B", "C"], default="A")
     parser.add_argument("--event-id", help="ID do CSV (sem .csv); padrão: primeiro evento da fazenda")
     parser.add_argument("--list-events", action="store_true")
