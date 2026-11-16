@@ -12,6 +12,7 @@ Uso (na raiz do projeto, Git Bash ou PowerShell):
     python Comum/src/treinar_modelos.py                     # tudo: 4 modelos, 95 eventos
     python Comum/src/treinar_modelos.py --farms A --jobs 4  # rápido: só a fazenda A
     python Comum/src/treinar_modelos.py --models arvore ensembles
+    python Comum/src/treinar_modelos.py --compare-only       # refaz só a comparação
 
 A execução é retomável: eventos já treinados são pulados.
 """
@@ -183,7 +184,8 @@ def select_and_evaluate(family, root, manifest, max_false, max_active):
         for config in configs:
             predicted = apply_config(scores, thresholds, config)
             results.append(dict(split=entry.split, farm=entry.farm, asset=entry.asset, event=entry.event,
-                                config=config_id(config), **measure(predicted, meta)))
+                                config=config_id(config), label=meta.event_label, event_start=str(meta.event_start),
+                                event_end=str(meta.event_end), **measure(predicted, meta)))
             if config == chosen:
                 predicted.assign(top_sensor=scores.top_sensor, top_residual=scores.top_residual).to_csv(
                     event_dir(root, entry) / "predictions.csv", index=False)
@@ -314,6 +316,7 @@ def plot_timelines(family, root, manifest, frozen):
 
 
 def kmeans_row(farms):
+    """Linha do K-means (perfil principal, detection_balanced) no mesmo escopo de fazendas, se existir."""
     base = PROJECT_ROOT / "K-means/outputs/detection_balanced"
     if not (base / "metrics.csv").exists():
         return None
@@ -323,7 +326,32 @@ def kmeans_row(farms):
     if scope is None:
         return None
     row = metrics.loc[metrics.split.eq("evaluation") & metrics.farm.eq(scope) & metrics.config.eq(frozen["config"])]
-    return None if row.empty else row.iloc[0]
+    if row.empty:
+        return None
+    values = row.iloc[0].drop(labels=["split", "farm", "config"], errors="ignore").to_dict()
+    return dict(modelo="K-means", chave="K-means", config=frozen["config"], r2=None, **values)
+
+
+def collect_rows(run, farms):
+    """Junta todos os modelos já avaliados nesta execução (--run), mesmo que treinados em comandos separados."""
+    scope = "ALL" if len(farms) == 3 else farms
+    rows = []
+    for family, (folder, title) in FAMILIES.items():
+        root = PROJECT_ROOT / folder / "outputs" / run
+        needed = [root / n for n in ("frozen_config.json", "metrics.csv", "regression.csv", "protocol.json")]
+        if not all(p.exists() for p in needed):
+            continue
+        if json.loads(needed[3].read_text(encoding="utf-8")).get("farms") != farms:
+            continue
+        frozen = json.loads(needed[0].read_text(encoding="utf-8"))
+        metrics, regression = pd.read_csv(needed[1]), pd.read_csv(needed[2])
+        row = metrics.loc[metrics.split.eq("evaluation") & metrics.farm.eq(scope) & metrics.config.eq(frozen["config"])]
+        if row.empty:
+            continue
+        values = row.iloc[0].drop(labels=["split", "farm", "config"]).to_dict()
+        rows.append(dict(modelo=title, chave=family, config=frozen["config"],
+                         r2=float(regression.loc[regression.split.eq("evaluation"), "mean_r2"].median()), **values))
+    return rows
 
 
 def write_comparison(rows, farms, run):
@@ -335,7 +363,7 @@ def write_comparison(rows, farms, run):
     scope = "ALL" if len(farms) == 3 else farms
     km = kmeans_row(farms)
     if km is not None:
-        rows = [dict(modelo="K-means", chave="K-means", config="detection_balanced", r2=None, **km.to_dict())] + rows
+        rows = [km] + rows
     table = pd.DataFrame(rows)
     keep = ["modelo", "config", "r2", "sensitivity", "signal_sensitivity", "specificity", "precision",
             "balanced_accuracy", "f2", "tp", "fn", "tn", "fp", "false_notifications_per_30_days",
@@ -387,10 +415,15 @@ def main():
     parser.add_argument("--run", default="principal", help="Nome da execução (subpasta de outputs)")
     parser.add_argument("--max-false-per-30-days", type=float, default=5.)
     parser.add_argument("--max-active-fraction", type=float, default=.25)
+    parser.add_argument("--compare-only", action="store_true",
+                        help="Só refaz a comparação com os resultados já salvos (não precisa do dataset)")
     args = parser.parse_args()
     farms = "".join(sorted(set(args.farms.upper())))
     if not farms or set(farms) - set("ABC"):
         parser.error("--farms aceita só A, B e C.")
+    if args.compare_only:
+        compare(farms, args.run)
+        return
     manifest = load_manifest(args.data_dir, farms)
     print(f"{len(manifest)} eventos ({manifest.split.eq('evaluation').sum()} reservados) · modelos: {args.models}", flush=True)
     roots = {f: PROJECT_ROOT / FAMILIES[f][0] / "outputs" / args.run for f in args.models}
@@ -417,7 +450,6 @@ def main():
             print(f"[{done}/{len(manifest)}] {line}", flush=True)
     print(f"Treino concluído em {(time.time() - started) / 60:.1f} min", flush=True)
 
-    comparison = []
     for family, root in roots.items():
         missing = [f"{e.farm}/{e.event}" for e in manifest.itertuples()
                    if not (event_dir(root, e) / "report.json").exists()]
@@ -427,15 +459,18 @@ def main():
             continue
         frozen, ranking, metrics, _, regression = select_and_evaluate(
             family, root, manifest, args.max_false_per_30_days, args.max_active_fraction)
-        main_row = write_results(family, root, frozen, ranking, metrics, regression, args)
+        write_results(family, root, frozen, ranking, metrics, regression, args)
         plot_timelines(family, root, manifest, frozen)
-        if main_row is not None:
-            comparison.append(dict(modelo=FAMILIES[family][1], chave=family, config=frozen["config"],
-                                   r2=float(regression.loc[regression.split.eq("evaluation"), "mean_r2"].median()),
-                                   **main_row.to_dict()))
         print(f"{family}: resultados em {root / 'RESULTADOS.md'}", flush=True)
-    if comparison:
-        write_comparison(comparison, farms, args.run)
+    compare(farms, args.run)
+
+
+def compare(farms, run):
+    rows = collect_rows(run, farms)
+    if rows:
+        write_comparison(rows, farms, run)
+    else:
+        print("Nenhum modelo avaliado nesta execução para comparar.", flush=True)
 
 
 if __name__ == "__main__":

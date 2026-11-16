@@ -9,7 +9,7 @@ Código compartilhado pelos modelos supervisionados do EoloSense. O K-means (pas
 | [SVM/](../SVM/README.md) | SVR com kernel RBF | `SVM/outputs/principal/RESULTADOS.md` |
 | [Regressao-Linear/](../Regressao-Linear/README.md) | Ridge (referência mínima) | `Regressao-Linear/outputs/principal/RESULTADOS.md` |
 
-Comparação dos quatro (e do K-means, se seus resultados existirem): `Comum/outputs/principal/COMPARACAO.md` e `comparacao.png`.
+Comparação dos quatro (e do K-means, se seus resultados existirem): `Comum/outputs/principal/COMPARACAO.md` e `comparacao.png`. Se os modelos forem treinados em comandos separados, `treinar_modelos.py --compare-only` refaz a comparação com tudo o que já existe. Para explorar os resultados evento a evento: `streamlit run app_streamlit.py` (veja o [README principal](../README.md#6-resultados)).
 
 ## Como rodar
 
