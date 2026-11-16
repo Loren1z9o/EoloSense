@@ -190,7 +190,7 @@ Cada pasta `outputs/<execução>/` (fora do Git) contém `RESULTADOS.md`, `metri
 
 ## 10. Equipe e referências
 
-**Equipe:** Miguel Firme · Lorenzo Viero Sartori · *(demais integrantes)*
+**Equipe:** Miguel Firme · Lorenzo Viero Sartori · João Gustavo
 
 **Referências**
 
