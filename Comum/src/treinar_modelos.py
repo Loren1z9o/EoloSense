@@ -14,6 +14,11 @@ Uso (na raiz do projeto, Git Bash ou PowerShell):
     python Comum/src/treinar_modelos.py --models arvore ensembles
     python Comum/src/treinar_modelos.py --compare-only       # refaz só a comparação
 
+2º experimento (sem retreinar): escolhe a regra pela acurácia balanceada, numa grade mais
+ampla, reaproveitando os escores salvos de outra execução:
+    python Comum/src/treinar_modelos.py --reusar principal --run acuracia_balanceada \
+        --criterio acuracia-balanceada --grade ampla --kmeans-run detection_acuracia_balanceada
+
 A execução é retomável: eventos já treinados são pulados.
 """
 from __future__ import annotations
@@ -39,7 +44,7 @@ from nbm import PROJECT_ROOT, load_event, score_frame, split_rows, train_nbm
 from alert_episodes import group_alerts  # noqa: E402  (K-means/src)
 from failure_alerts import apply_alarm_rule  # noqa: E402
 from kmeans_baseline import choose_file, event_files, farm_name  # noqa: E402
-from tune_detection import BASELINE, CONFIGS, RECOVERY_HOURS, measure, rank_candidates, summarize  # noqa: E402
+from tune_detection import BASELINE, CONFIGS, GRIDS, RECOVERY_HOURS, measure, rank_candidates, summarize  # noqa: E402
 from tune_alert_rules import config_id  # noqa: E402
 
 FAMILIES = {
@@ -50,6 +55,15 @@ FAMILIES = {
 }
 COLORS = {"K-means": "#2a78d6", "arvore": "#eb6834", "ensembles": "#1baf7a", "svm": "#eda100", "linear": "#e87ba4"}
 INK, MUTED, CRITICAL, SURFACE = "#0b0b0b", "#52514e", "#d03b3b", "#fcfcfb"
+# Nomes da linha de comando → nomes internos de tune_detection.py
+CRITERIOS = {"sensibilidade": "sensitivity", "acuracia-balanceada": "balanced"}
+GRADES = {"padrao": "standard", "ampla": "wide"}
+SELECAO = {
+    "sensitivity": "maior sensibilidade de avisos dentro do orçamento no desenvolvimento; congelada antes dos reservados",
+    "balanced": "maior acurácia balanceada por evento ((sensibilidade + especificidade) / 2) dentro do orçamento no "
+                "desenvolvimento; congelada antes dos reservados",
+}
+KMEANS_RUN = "detection_balanced"
 
 
 # --- Partição -------------------------------------------------------------------------
@@ -156,26 +170,42 @@ def apply_config(scores, thresholds, config):
     return group_alerts(ruled, RECOVERY_HOURS)[0]
 
 
-def select_and_evaluate(family, root, manifest, max_false, max_active):
+def select_and_evaluate(family, root, manifest, max_false, max_active, criterion="sensitivity", grid="standard",
+                        source=None):
+    """Escolhe a regra só no desenvolvimento e avalia nos reservados.
+
+    `source` é a pasta da execução com os escores já calculados (padrão: a própria `root`). Com outra pasta,
+    nada é retreinado: só a regra de alerta é refeita e os resultados são gravados em `root`.
+    """
+    source = root if source is None else source
+    configs = GRIDS[grid][1]
     cache = {}
     for entry in manifest.itertuples():
-        cache[(entry.farm, entry.event)] = (entry, *read_event(root, entry), event_meta(entry.path, entry.event))
+        cache[(entry.farm, entry.event)] = (entry, *read_event(source, entry), event_meta(entry.path, entry.event))
     selection = []
     for entry, report, scores, thresholds, meta in (cache[(e.farm, e.event)] for e in manifest.itertuples()
                                                     if e.split == "selection"):
-        for config in CONFIGS:
+        missing = {c[0] for c in configs} - set(thresholds)
+        if missing:
+            raise SystemExit(f"{family} {entry.farm}/{entry.event}: limiares {sorted(missing)} não foram salvos.")
+        for config in configs:
             selection.append(dict(farm=entry.farm, asset=entry.asset, event=entry.event,
                                   config=config_id(config), quantile=config[0], hours=config[1], fraction=config[2],
                                   **measure(apply_config(scores, thresholds, config), meta)))
     pd.DataFrame(selection).to_csv(root / "selection_events.csv", index=False)
-    ranking = rank_candidates(selection, max_false, max_active)
+    ranking = rank_candidates(selection, max_false, max_active, criterion)
     ranking.to_csv(root / "selection_ranking.csv", index=False)
     winner = ranking.iloc[0]
     chosen = (float(winner["quantile"]), int(winner.hours), float(winner.fraction))
     frozen = dict(config=config_id(chosen), quantile=chosen[0], hours=chosen[1], alarm_fraction=chosen[2],
                   recovery_hours=RECOVERY_HOURS, accepted_development=bool(winner.within_budget),
                   max_false_per_30_days=max_false, max_active_fraction=max_active,
-                  development_sensitivity=float(winner.sensitivity))
+                  criterion=criterion, grid=grid, grid_size=len(configs),
+                  scores_from=str(source.relative_to(PROJECT_ROOT)) if source.is_relative_to(PROJECT_ROOT) else str(source),
+                  development_sensitivity=float(winner.sensitivity),
+                  development_specificity=None if pd.isna(winner.specificity) else float(winner.specificity),
+                  development_balanced_accuracy=None if pd.isna(winner.balanced_accuracy)
+                  else float(winner.balanced_accuracy))
     (root / "frozen_config.json").write_text(json.dumps(frozen, indent=2), encoding="utf-8")
     # Só agora, com a regra congelada, os eventos reservados são consultados.
     results, regression = [], []
@@ -187,6 +217,7 @@ def select_and_evaluate(family, root, manifest, max_false, max_active):
                                 config=config_id(config), label=meta.event_label, event_start=str(meta.event_start),
                                 event_end=str(meta.event_end), **measure(predicted, meta)))
             if config == chosen:
+                event_dir(root, entry).mkdir(parents=True, exist_ok=True)
                 predicted.assign(top_sensor=scores.top_sensor, top_residual=scores.top_residual).to_csv(
                     event_dir(root, entry) / "predictions.csv", index=False)
         regression.append(dict(split=entry.split, farm=entry.farm, event=entry.event, label=report["label"],
@@ -234,6 +265,8 @@ def write_results(family, root, frozen, ranking, metrics, regression, args):
                     f"{group.cal_z_rmse.median():.3f} |")
     text += ["", f"Configuração escolhida na validação interna, por evento: {chosen_counts(regression)}.", "",
              "## 2. O alerta pega a falha a tempo?", "",
+             f"Critério de escolha: **{SELECAO[frozen.get('criterion', 'sensitivity')]}** "
+             f"({frozen.get('grid_size', len(CONFIGS))} regras testadas).", "",
              f"Regra congelada no desenvolvimento: **{frozen['config']}** (percentil {frozen['quantile']}, janela de "
              f"{frozen['hours']} h, {frozen['alarm_fraction']:.0%} de excedências, recuperação de {frozen['recovery_hours']} h). "
              f"Dentro do orçamento (≤ {frozen['max_false_per_30_days']} avisos falsos por 30 dias e ≤ "
@@ -248,11 +281,13 @@ def write_results(family, root, frozen, ranking, metrics, regression, args):
                     f"{pct(row.precision)} | {pct(row.balanced_accuracy)} | {row.tp} | {row.fn} | {row.tn} | {row.fp} | "
                     f"{row.false_notifications_per_30_days:.2f} | {pct(row.normal_incident_active_fraction)} |")
     text += ["", "### Desenvolvimento (5 melhores regras do ranking)", "",
-             "| Regra | Sensibilidade | Precisão | Avisos falsos / 30 dias | Tempo ativo normal | Dentro do orçamento |",
-             "| --- | ---: | ---: | ---: | ---: | --- |"]
+             "| Regra | Sensibilidade | Especificidade | Precisão | Acurácia balanceada | Avisos falsos / 30 dias | "
+             "Tempo ativo normal | Dentro do orçamento |",
+             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"]
     for row in ranking.head(5).itertuples():
-        text.append(f"| {row.config} | {pct(row.sensitivity)} | {pct(row.precision)} | "
-                    f"{row.false_notifications_per_30_days:.2f} | {pct(row.normal_incident_active_fraction)} | {row.within_budget} |")
+        text.append(f"| {row.config} | {pct(row.sensitivity)} | {pct(row.specificity)} | {pct(row.precision)} | "
+                    f"{pct(row.balanced_accuracy)} | {row.false_notifications_per_30_days:.2f} | "
+                    f"{pct(row.normal_incident_active_fraction)} | {row.within_budget} |")
     text += ["", "## Como ler", "",
              "- **Sensibilidade**: dos eventos com anomalia, quantos receberam um aviso novo dentro da janela anotada.",
              "- **Especificidade**: dos eventos normais, quantos passaram sem nenhum aviso.",
@@ -265,6 +300,9 @@ def write_results(family, root, frozen, ranking, metrics, regression, args):
              "regressão por evento), `selection_ranking.csv`, `frozen_config.json`, `protocol.json` e "
              "`eventos/farm_X_event_N/` com `model.joblib`, `scores.csv`, `predictions.csv` e `report.json` "
              "(alvos, entradas, grade testada, importâncias).", ""]
+    if frozen.get("scores_from") and Path(PROJECT_ROOT / frozen["scores_from"]).resolve() != root.resolve():
+        text += [f"Esta execução não retreinou nada: `model.joblib`, `scores.csv` e `report.json` estão em "
+                 f"`{frozen['scores_from']}/eventos/`. Aqui ficam só a nova regra e o `predictions.csv` de cada evento.", ""]
     (root / "RESULTADOS.md").write_text("\n".join(text), encoding="utf-8")
     return main
 
@@ -280,7 +318,8 @@ def style(ax):
     ax.set_axisbelow(True)
 
 
-def plot_timelines(family, root, manifest, frozen):
+def plot_timelines(family, root, manifest, frozen, source=None):
+    source = root if source is None else source
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -290,7 +329,7 @@ def plot_timelines(family, root, manifest, frozen):
         return
     figure, axes = plt.subplots(len(picks), 1, figsize=(10, 2.3 * len(picks)), facecolor=SURFACE, squeeze=False)
     for ax, entry in zip(axes[:, 0], picks.itertuples()):
-        report, scores, thresholds = read_event(root, entry)
+        report, scores, thresholds = read_event(source, entry)
         meta = event_meta(entry.path, entry.event)
         predicted = apply_config(scores, thresholds, (frozen["quantile"], frozen["hours"], frozen["alarm_fraction"]))
         style(ax)
@@ -315,9 +354,9 @@ def plot_timelines(family, root, manifest, frozen):
     plt.close(figure)
 
 
-def kmeans_row(farms):
-    """Linha do K-means (perfil principal, detection_balanced) no mesmo escopo de fazendas, se existir."""
-    base = PROJECT_ROOT / "K-means/outputs/detection_balanced"
+def kmeans_row(farms, kmeans_run=KMEANS_RUN):
+    """Linha do K-means (pasta K-means/outputs/<kmeans_run>) no mesmo escopo de fazendas, se existir."""
+    base = PROJECT_ROOT / "K-means/outputs" / kmeans_run
     if not (base / "metrics.csv").exists():
         return None
     frozen = json.loads((base / "frozen_config.json").read_text(encoding="utf-8"))
@@ -354,16 +393,18 @@ def collect_rows(run, farms):
     return rows
 
 
-def write_comparison(rows, farms, run):
+def write_comparison(rows, farms, run, kmeans_run=KMEANS_RUN):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     output = PROJECT_ROOT / "Comum/outputs" / run
     output.mkdir(parents=True, exist_ok=True)
     scope = "ALL" if len(farms) == 3 else farms
-    km = kmeans_row(farms)
+    km = kmeans_row(farms, kmeans_run)
     if km is not None:
         rows = [km] + rows
+    (output / "comparacao.json").write_text(json.dumps(dict(kmeans_run=kmeans_run if km is not None else None),
+                                                       indent=2), encoding="utf-8")
     table = pd.DataFrame(rows)
     keep = ["modelo", "config", "r2", "sensitivity", "signal_sensitivity", "specificity", "precision",
             "balanced_accuracy", "f2", "tp", "fn", "tn", "fp", "false_notifications_per_30_days",
@@ -378,8 +419,10 @@ def write_comparison(rows, farms, run):
         text.append(f"| {row.modelo} | {r2} | {pct(row.sensitivity)} | {pct(row.specificity)} | {pct(row.precision)} | "
                     f"{pct(row.balanced_accuracy)} | {row.false_notifications_per_30_days:.2f} | {row.config} |")
     if km is None:
-        text += ["", "K-means ausente: rode `K-means/src/tune_detection.py --max-false-per-30-days 5 --output-dir "
-                 "K-means/outputs/detection_balanced` (todas as fazendas ou a mesma fazenda única) para incluí-lo."]
+        text += ["", f"K-means ausente: não há resultados em `K-means/outputs/{kmeans_run}` (veja "
+                 "K-means/DETECCAO_E_ALERTAS.md; use `--kmeans-run` para apontar outra pasta)."]
+    else:
+        text += ["", f"K-means: resultados de `K-means/outputs/{kmeans_run}`."]
     text += ["", "Critério experimental do projeto para aceitar um detector: sensibilidade ≥ 70% e especificidade ≥ 80%.", ""]
     (output / "COMPARACAO.md").write_text("\n".join(text), encoding="utf-8")
 
@@ -415,18 +458,55 @@ def main():
     parser.add_argument("--run", default="principal", help="Nome da execução (subpasta de outputs)")
     parser.add_argument("--max-false-per-30-days", type=float, default=5.)
     parser.add_argument("--max-active-fraction", type=float, default=.25)
+    parser.add_argument("--criterio", choices=list(CRITERIOS), default="sensibilidade",
+                        help="Como escolher a regra de alerta no desenvolvimento: sensibilidade (1º experimento) ou "
+                             "acuracia-balanceada (sensibilidade e especificidade juntas)")
+    parser.add_argument("--grade", choices=list(GRADES), default="padrao",
+                        help="padrao (24 regras) ou ampla (75 regras: inclui P99, janelas de 48/72 h e fração 50%%)")
+    parser.add_argument("--reusar", metavar="RUN",
+                        help="Não treina: reaproveita modelos e escores de outputs/RUN e refaz só a regra de alerta, "
+                             "gravando em outputs/<--run>")
+    parser.add_argument("--kmeans-run", default=KMEANS_RUN,
+                        help=f"Pasta K-means/outputs/<nome> usada na comparação (padrão: {KMEANS_RUN})")
     parser.add_argument("--compare-only", action="store_true",
                         help="Só refaz a comparação com os resultados já salvos (não precisa do dataset)")
     args = parser.parse_args()
     farms = "".join(sorted(set(args.farms.upper())))
     if not farms or set(farms) - set("ABC"):
         parser.error("--farms aceita só A, B e C.")
+    if args.reusar and args.reusar == args.run:
+        parser.error("--reusar precisa de um --run diferente, para não sobrescrever o experimento original.")
+    criterion, grid = CRITERIOS[args.criterio], GRADES[args.grade]
     if args.compare_only:
-        compare(farms, args.run)
+        compare(farms, args.run, args.kmeans_run)
         return
     manifest = load_manifest(args.data_dir, farms)
     print(f"{len(manifest)} eventos ({manifest.split.eq('evaluation').sum()} reservados) · modelos: {args.models}", flush=True)
     roots = {f: PROJECT_ROOT / FAMILIES[f][0] / "outputs" / args.run for f in args.models}
+    if args.reusar:
+        sources = reuse_sources(args, manifest, farms, criterion, grid, roots)
+    else:
+        sources = train_all(args, manifest, farms, criterion, grid, roots)
+
+    for family, root in roots.items():
+        source = sources.get(family)
+        if source is None:
+            continue
+        missing = [f"{e.farm}/{e.event}" for e in manifest.itertuples()
+                   if not (event_dir(source, e) / "report.json").exists()]
+        if missing:
+            print(f"{family}: {len(missing)} eventos sem modelo ({missing[:5]}...). Veja error.json; "
+                  "métricas não publicadas para não esconder falhas.", flush=True)
+            continue
+        frozen, ranking, metrics, _, regression = select_and_evaluate(
+            family, root, manifest, args.max_false_per_30_days, args.max_active_fraction, criterion, grid, source)
+        write_results(family, root, frozen, ranking, metrics, regression, args)
+        plot_timelines(family, root, manifest, frozen, source)
+        print(f"{family}: regra {frozen['config']} · resultados em {root / 'RESULTADOS.md'}", flush=True)
+    compare(farms, args.run, args.kmeans_run)
+
+
+def train_all(args, manifest, farms, criterion, grid, roots):
     code = [Path(__file__), Path(nbm.__file__)] + [nbm.KMEANS_SRC / n for n in (
         "alert_episodes.py", "failure_alerts.py", "tune_detection.py", "shared_reference.py")]
     protocol = dict(python=platform.python_version(), numpy=np.__version__, pandas=pd.__version__,
@@ -434,9 +514,9 @@ def main():
                     calibration_fraction=nbm.CALIBRATION_FRACTION, validation_fraction=nbm.VALIDATION_FRACTION,
                     gap="1 dia", max_targets=nbm.MAX_TARGETS, min_target_r2=nbm.MIN_TARGET_R2,
                     smoothing=nbm.SMOOTHING, svr_rows=nbm.SVR_ROWS, quantiles=list(nbm.QUANTILES),
-                    alert_grid=[config_id(c) for c in CONFIGS], baseline=config_id(BASELINE),
+                    alert_grid=[config_id(c) for c in GRIDS[grid][1]], baseline=config_id(BASELINE),
                     max_false_per_30_days=args.max_false_per_30_days, max_active_fraction=args.max_active_fraction,
-                    selection="maior sensibilidade de avisos dentro do orçamento no desenvolvimento; congelada antes dos reservados",
+                    criterion=criterion, grid=grid, selection=SELECAO[criterion],
                     source_sha256={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in code})
     for family, root in roots.items():
         root.mkdir(parents=True, exist_ok=True)
@@ -449,26 +529,41 @@ def main():
         for line in lines:
             print(f"[{done}/{len(manifest)}] {line}", flush=True)
     print(f"Treino concluído em {(time.time() - started) / 60:.1f} min", flush=True)
+    return dict(roots)
 
+
+def reuse_sources(args, manifest, farms, criterion, grid, roots):
+    """Confere que a execução de origem tem a mesma partição e fazendas; grava o protocolo do novo experimento."""
+    sources = {}
     for family, root in roots.items():
-        missing = [f"{e.farm}/{e.event}" for e in manifest.itertuples()
-                   if not (event_dir(root, e) / "report.json").exists()]
-        if missing:
-            print(f"{family}: {len(missing)} eventos sem modelo ({missing[:5]}...). Veja error.json; "
-                  "métricas não publicadas para não esconder falhas.", flush=True)
+        source = PROJECT_ROOT / FAMILIES[family][0] / "outputs" / args.reusar
+        if not (source / "protocol.json").exists():
+            print(f"{family}: sem outputs/{args.reusar}; pulado.", flush=True)
             continue
-        frozen, ranking, metrics, _, regression = select_and_evaluate(
-            family, root, manifest, args.max_false_per_30_days, args.max_active_fraction)
-        write_results(family, root, frozen, ranking, metrics, regression, args)
-        plot_timelines(family, root, manifest, frozen)
-        print(f"{family}: resultados em {root / 'RESULTADOS.md'}", flush=True)
-    compare(farms, args.run)
+        original = json.loads((source / "protocol.json").read_text(encoding="utf-8"))
+        if original.get("farms") != farms:
+            raise SystemExit(f"{family}: outputs/{args.reusar} foi treinado com as fazendas {original.get('farms')}, "
+                             f"não {farms}.")
+        old = pd.read_csv(source / "manifest.csv", dtype=str)[["farm", "event", "split"]]
+        new = manifest[["farm", "event", "split"]].astype(str)
+        if not old.sort_values(["farm", "event"]).reset_index(drop=True).equals(
+                new.sort_values(["farm", "event"]).reset_index(drop=True)):
+            raise SystemExit(f"{family}: a partição de outputs/{args.reusar} difere da atual.")
+        root.mkdir(parents=True, exist_ok=True)
+        manifest.to_csv(root / "manifest.csv", index=False)
+        protocol = dict(original, alert_grid=[config_id(c) for c in GRIDS[grid][1]],
+                        max_false_per_30_days=args.max_false_per_30_days, max_active_fraction=args.max_active_fraction,
+                        criterion=criterion, grid=grid, selection=SELECAO[criterion], reusa_run=args.reusar,
+                        note=f"Modelos e escores de outputs/{args.reusar} (sem retreino); só a regra de alerta mudou.")
+        (root / "protocol.json").write_text(json.dumps(protocol, indent=2, ensure_ascii=False), encoding="utf-8")
+        sources[family] = source
+    return sources
 
 
-def compare(farms, run):
+def compare(farms, run, kmeans_run=KMEANS_RUN):
     rows = collect_rows(run, farms)
     if rows:
-        write_comparison(rows, farms, run)
+        write_comparison(rows, farms, run, kmeans_run)
     else:
         print("Nenhum modelo avaliado nesta execução para comparar.", flush=True)
 
