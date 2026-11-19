@@ -282,10 +282,10 @@ def prune_tree(estimator, x_tr, y_tr, x_va, y_va):
     return best[3], best[2], [dict(ccp_alpha=r[2], val_z_rmse=r[0]) for r in rows]
 
 
-def tune(family, x_tr, y_tr, x_va, y_va, seed=SEED):
+def tune(family, x_tr, y_tr, x_va, y_va, seed=SEED, candidate_options=None):
     rng = np.random.default_rng(seed)
     table, best = [], None
-    for order, (label, estimator, limit) in enumerate(candidate_grid(family)):
+    for order, (label, estimator, limit) in enumerate(candidate_options if candidate_options is not None else candidate_grid(family)):
         xs, ys = x_tr, y_tr
         if limit and len(xs) > limit:
             pick = rng.choice(len(xs), limit, replace=False)
@@ -305,22 +305,23 @@ class TrainedNBM:
     regression: dict
 
 
-def train_nbm(frame, features, descriptions, family, farm, asset_id):
+def train_nbm(frame, features, descriptions, family, farm, asset_id, *,
+              layout_planner=None, target_selector=None, candidate_options=None, max_fit_rows=MAX_FIT_ROWS):
     started = time.perf_counter()
     parts = split_event(frame)
-    layout = plan_layout(parts["fit_train"], features, descriptions)
+    layout = (layout_planner or plan_layout)(parts["fit_train"], features, descriptions)
     full = add_engineered(frame, layout)
     view = {k: full.loc[v.index] for k, v in parts.items() if isinstance(v, pd.DataFrame)}
-    fit_train = sample(view["fit_train"], int(MAX_FIT_ROWS * (1 - VALIDATION_FRACTION)))
+    fit_train = sample(view["fit_train"], int(max_fit_rows * (1 - VALIDATION_FRACTION)))
     fit_val = sample(view["fit_val"], MAX_VALIDATION_ROWS)
-    targets, target_r2 = choose_targets(fit_train, fit_val, layout.x_columns, layout.candidates)
+    targets, target_r2 = (target_selector or choose_targets)(fit_train, fit_val, layout.x_columns, layout.candidates)
 
     x_tr, y_tr = complete_targets(*matrices(fit_train, layout.x_columns, targets))
     x_va, y_va = complete_targets(*matrices(fit_val, layout.x_columns, targets))
     y_scaler = StandardScaler().fit(y_tr)
     yz_tr, yz_va = y_scaler.transform(y_tr), y_scaler.transform(y_va)
 
-    (best_error, _, label, estimator, limit), table = tune(family, x_tr, yz_tr, x_va, yz_va)
+    (best_error, _, label, estimator, limit), table = tune(family, x_tr, yz_tr, x_va, yz_va, candidate_options=candidate_options)
     pruning = None
     if family == "arvore":
         pruned, alpha, pruning = prune_tree(clone(estimator).fit(x_tr, yz_tr), x_tr, yz_tr, x_va, yz_va)
@@ -338,7 +339,7 @@ def train_nbm(frame, features, descriptions, family, farm, asset_id):
     val_error = z_rmse(yz_va, probe.predict(x_va))
 
     # Modelo final: mesmo hiperparâmetro, reajustado com todo o trecho de ajuste.
-    fit_all = sample(view["fit"], MAX_FIT_ROWS)
+    fit_all = sample(view["fit"], max_fit_rows)
     x_fit, y_fit = complete_targets(*matrices(fit_all, layout.x_columns, targets))
     if limit and len(x_fit) > limit:
         pick = rng.choice(len(x_fit), limit, replace=False)

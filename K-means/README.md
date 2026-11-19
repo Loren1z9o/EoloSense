@@ -1,5 +1,7 @@
 # K-means — primeira exploração
 
+Retreinamento do K-means no novo estudo da fazenda C: [ESTUDO_FAZENDA_C.md](ESTUDO_FAZENDA_C.md). Os estudos anteriores permanecem preservados.
+
 **Versão principal adotada:** K=32, P95, janela de 6h, excedências de 25% e recuperação de 6h, com avisos agrupados e estado entre blocos. Guia em [DETECCAO_E_ALERTAS.md](DETECCAO_E_ALERTAS.md); modelos em [outputs/detection_balanced/](outputs/detection_balanced/). O comando principal `failure_alerts.py train` usa esse perfil por padrão. As seções seguintes registram experimentos históricos.
 
 Fluxo que prioriza detecção com controle de episódios e avisos repetidos: [DETECCAO_E_ALERTAS.md](DETECCAO_E_ALERTAS.md). Inclui estado entre blocos e comparação de regras por sensibilidade e carga de notificações.

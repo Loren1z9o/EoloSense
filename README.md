@@ -1,5 +1,7 @@
 # 🌬️ EoloSense
 
+Estudo adicional da fazenda C com todos os modelos retreinados e sensores multivariados: [protocolo e comandos](Comum/FAZENDA_C_MULTISSENSORES.md). A compara??o fica separada dos resultados principais anteriores.
+
 **Detecção precoce de falhas em turbinas eólicas a partir dos sensores SCADA, para evitar paradas não programadas da geração.**
 
 Projeto final da disciplina de **Machine Learning Clássico** · Engenharia de Computação · Centro Universitário UniSATC · 2026 · Prof. Dr. Rodrigo Ramos Silva

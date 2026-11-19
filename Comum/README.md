@@ -1,5 +1,7 @@
 # Modelos de comportamento normal — Árvore, Ensembles, SVM e baseline linear
 
+Novo estudo somente na fazenda C, com retreinamento e sensores de temperatura, vibra??o, press?o e grandezas el?tricas: [FAZENDA_C_MULTISSENSORES.md](FAZENDA_C_MULTISSENSORES.md). Resultados separados em `outputs/fazenda_C_componentes/`.
+
 Código compartilhado pelos modelos supervisionados do EoloSense. O K-means (pasta `K-means/`) agrupa os sensores sem alvo; estes modelos fazem outra pergunta: **"dadas as condições de operação de agora, qual temperatura cada componente deveria ter se a turbina estivesse saudável?"** Quando a temperatura real se afasta da prevista de forma persistente, sai um aviso.
 
 | Pasta | Modelo | Resultados |
