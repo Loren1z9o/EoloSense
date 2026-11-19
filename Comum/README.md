@@ -87,6 +87,24 @@ Como antes, a regra é escolhida só no desenvolvimento e congelada antes de abr
 
 A comparação sai em `Comum/outputs/acuracia_balanceada/COMPARACAO.md`, e o painel mostra a execução `acuracia_balanceada` no seletor "Resultados".
 
+## 3º experimento: variantes do escore (sem retreino)
+
+O diagnóstico de AUC por evento (`src/diagnostico_auc_eventos.py`) deu perto de 0,5: o pico do escore atual quase não ordena falha acima de normal, e nenhuma regra corrige isso. O 3º experimento muda o **escore**, reaproveitando os `model.joblib` de `outputs/principal` (só refaz as previsões):
+
+| Eixo | Atual | Alternativa | Hipótese |
+| --- | --- | --- | --- |
+| Sinal | \|resíduo\| | só resíduo positivo | falha aquece; resfriamento e queda de leitura geram falso aviso |
+| Agregação | maior alvo | média dos 2 maiores | um sensor ruidoso sozinho não basta |
+| Tempo | média de 1 h | + mediana de 24 h | falhas evoluem em dias; picos isolados somem |
+
+São 8 variantes. A escolha é feita **só no desenvolvimento**, em duas etapas: (1) a variante de maior AUC por evento (pico / P99 da calibração); em empate, fica o escore atual; (2) a regra de alerta de maior acurácia balanceada para essa variante (45 regras, P95 a P99,9, mesmo orçamento). Depois de congelar, os reservados são avaliados uma vez, ao lado de uma referência: o escore atual passando pela mesma etapa 2. O script confere, evento a evento, que a variante atual reproduz o `scores.csv` salvo.
+
+```bash
+./.venv/Scripts/python.exe -X utf8 Comum/src/estudo_escore.py --jobs 4
+```
+
+Resultado em `Comum/outputs/escore_variantes/RESULTADOS.md`. O K-means não entra, porque o escore dele é distância a protótipos, não resíduo por sensor.
+
 Limites que valem para todos os modelos: os 30 reservados já foram consultados nos experimentos do K-means (avaliação interna reutilizada, não teste externo intocado); eventos da mesma turbina são correlacionados; não se prevê a data da falha nem se calcula o CARE score oficial.
 
 ## Arquivos
