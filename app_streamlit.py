@@ -45,9 +45,26 @@ def runs() -> list[str]:
     return sorted(found, key=lambda r: (r != "principal", r))
 
 
+def kmeans_run(run: str) -> str:
+    """Pasta do K-means usada na comparação desta execução (gravada por treinar_modelos.py)."""
+    path = ROOT / "Comum/outputs" / run / "comparacao.json"
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8")).get("kmeans_run") or KMEANS_RUN
+    return KMEANS_RUN
+
+
 def run_dir(key: str, run: str) -> Path:
     folder = ROOT / MODELS[key][0]
-    return folder / (KMEANS_RUN if key == "kmeans" else run)
+    return folder / (kmeans_run(run) if key == "kmeans" else run)
+
+
+def artifact_dir(key: str, run: str, farm: str, event: str) -> Path:
+    """Pasta com model.joblib/report.json. Uma execução feita com --reusar aponta para a de origem."""
+    protocol = run_dir(key, run) / "protocol.json"
+    source = run
+    if protocol.exists():
+        source = json.loads(protocol.read_text(encoding="utf-8")).get("reusa_run") or run
+    return run_dir(key, source) / "eventos" / f"farm_{farm}_event_{event}"
 
 
 def available(run: str) -> list[str]:
@@ -82,7 +99,7 @@ def predictions(key: str, run: str, farm: str, event: str) -> pd.DataFrame | Non
 
 
 def report(key: str, run: str, farm: str, event: str) -> dict:
-    path = run_dir(key, run) / "eventos" / f"farm_{farm}_event_{event}" / "report.json"
+    path = artifact_dir(key, run, farm, event) / "report.json"
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 
 
@@ -235,7 +252,7 @@ with tab_theory:
     label = {r.Index: f"Fazenda {r.farm} · evento {r.event} · {r.label}" for r in info.itertuples()}
     choice = c2.selectbox("Evento ", list(label), format_func=label.get)
     meta = info.loc[choice]
-    folder = run_dir(key, run) / "eventos" / f"farm_{meta.farm}_event_{meta.event}"
+    folder = artifact_dir(key, run, meta.farm, meta.event)
     manifest = pd.read_csv(run_dir(key, run) / "manifest.csv", dtype={"event": str})
     source = Path(manifest.query("farm == @meta.farm and event == @meta.event").path.iloc[0])
     if not source.exists() or not (folder / "model.joblib").exists():

@@ -63,6 +63,48 @@ seção de treino, status 0 (operação normal), em ordem cronológica
 - **Regra de alerta** (24 combinações de percentil × janela × fração, a mesma grade do K-means): escolhida só nos 65 eventos de desenvolvimento, pela maior sensibilidade de avisos dentro do orçamento de **até 5 avisos falsos por 30 dias** e **até 25% de tempo em incidente** em trechos normais. É congelada antes de abrir os 30 reservados.
 - **Duas camadas de métrica**: (1) regressão — MAE, RMSE e R² por alvo na calibração; (2) detecção por evento — sensibilidade (aviso novo dentro da janela anotada), especificidade (evento normal sem aviso), precisão, avisos falsos por 30 dias.
 
+## 2º experimento: regra escolhida pela acurácia balanceada
+
+Na execução `principal` (16/11/2026), a regra foi escolhida pela **maior sensibilidade** dentro do orçamento de 5 avisos falsos por 30 dias. A especificidade não entrava na escolha, e o orçamento praticamente a zera: nos reservados, cada evento normal tem cerca de 18,7 dias monitorados, o que dá uns 3 avisos falsos por evento. Se os avisos caíssem ao acaso, só uns 5% dos eventos normais passariam sem nenhum. Saiu 1 de 15 (6,7%), e a acurácia balanceada ficou entre 30% e 53%, perto ou abaixo dos 50% de um sorteio. A regressão estava boa (R² 0,91–0,95); o problema era a regra de alerta.
+
+O 2º experimento muda só a escolha da regra, sem retreinar nada:
+
+- **Critério** (`--criterio acuracia-balanceada`): maior acurácia balanceada por evento, (sensibilidade + especificidade) / 2, nos 65 eventos de desenvolvimento. Desempate por sensibilidade e depois por menos avisos falsos. O orçamento (5 avisos falsos / 30 dias, 25% de tempo ativo) continua valendo como teto.
+- **Grade ampla** (`--grade ampla`): 75 regras em vez de 24. Acrescenta o percentil 99, janelas de 48 e 72 h e fração de excedências de 50%, regras mais exigentes que só fazem sentido quando a especificidade conta. A grade padrão está toda contida nela.
+- **Sem retreino** (`--reusar principal`): lê `scores.csv` e os limiares salvos em `outputs/principal/` e grava a nova regra, as métricas e os `predictions.csv` em outra pasta. A execução `principal` fica intacta, e os dois experimentos continuam visíveis.
+
+Como antes, a regra é escolhida só no desenvolvimento e congelada antes de abrir os 30 reservados. O registro fica em `frozen_config.json` (`criterion`, `grid`, `scores_from`).
+
+```bash
+# K-means com o mesmo critério e a mesma grade (precisa de K-means/outputs/failure_alerts_evaluation)
+./.venv/Scripts/python.exe K-means/src/tune_detection.py --max-false-per-30-days 5 --criterion balanced --grid wide \
+    --output-dir K-means/outputs/detection_acuracia_balanceada
+
+# Árvore, Ensembles, SVM e Ridge: só a regra de alerta, a partir da execução principal (minutos)
+./.venv/Scripts/python.exe Comum/src/treinar_modelos.py --reusar principal --run acuracia_balanceada \
+    --criterio acuracia-balanceada --grade ampla --kmeans-run detection_acuracia_balanceada
+```
+
+A comparação sai em `Comum/outputs/acuracia_balanceada/COMPARACAO.md`, e o painel mostra a execução `acuracia_balanceada` no seletor "Resultados".
+
+## 3º experimento: variantes do escore (sem retreino)
+
+O diagnóstico de AUC por evento (`src/diagnostico_auc_eventos.py`) deu perto de 0,5: o pico do escore atual quase não ordena falha acima de normal, e nenhuma regra corrige isso. O 3º experimento muda o **escore**, reaproveitando os `model.joblib` de `outputs/principal` (só refaz as previsões):
+
+| Eixo | Atual | Alternativa | Hipótese |
+| --- | --- | --- | --- |
+| Sinal | \|resíduo\| | só resíduo positivo | falha aquece; resfriamento e queda de leitura geram falso aviso |
+| Agregação | maior alvo | média dos 2 maiores | um sensor ruidoso sozinho não basta |
+| Tempo | média de 1 h | + mediana de 24 h | falhas evoluem em dias; picos isolados somem |
+
+São 8 variantes. A escolha é feita **só no desenvolvimento**, em duas etapas: (1) a variante de maior AUC por evento (pico / P99 da calibração); em empate, fica o escore atual; (2) a regra de alerta de maior acurácia balanceada para essa variante (45 regras, P95 a P99,9, mesmo orçamento). Depois de congelar, os reservados são avaliados uma vez, ao lado de uma referência: o escore atual passando pela mesma etapa 2. O script confere, evento a evento, que a variante atual reproduz o `scores.csv` salvo.
+
+```bash
+./.venv/Scripts/python.exe -X utf8 Comum/src/estudo_escore.py --jobs 4
+```
+
+Resultado em `Comum/outputs/escore_variantes/RESULTADOS.md`. O K-means não entra, porque o escore dele é distância a protótipos, não resíduo por sensor.
+
 Limites que valem para todos os modelos: os 30 reservados já foram consultados nos experimentos do K-means (avaliação interna reutilizada, não teste externo intocado); eventos da mesma turbina são correlacionados; não se prevê a data da falha nem se calcula o CARE score oficial.
 
 ## Arquivos

@@ -95,7 +95,7 @@ Todos os modelos seguem as mesmas regras, então os números são comparáveis:
 1. **Um modelo por evento**, treinado só com a seção de treino em operação normal (`status_type_id = 0`).
 2. **Divisão cronológica** dentro do treino normal: ajuste, 1 dia de intervalo e calibração (últimos 20%). O limiar é um percentil do escore na calibração.
 3. **Partição por turbina**: 30% das turbinas de cada fazenda, por hash SHA-256 com semente 42. Resultado: **65 eventos de desenvolvimento** e **30 reservados**. Eventos da mesma turbina nunca ficam dos dois lados.
-4. **Regra de alerta** (percentil × janela × fração de excedências) escolhida só no desenvolvimento, com orçamento de **até 5 avisos falsos por 30 dias** e **até 25% do tempo em incidente** em trechos normais. Ela é congelada antes de abrir os reservados.
+4. **Regra de alerta** (percentil × janela × fração de excedências) escolhida só no desenvolvimento, com orçamento de **até 5 avisos falsos por 30 dias** e **até 25% do tempo em incidente** em trechos normais. Ela é congelada antes de abrir os reservados. No 1º experimento, a regra escolhida foi a de maior sensibilidade. No 2º, foi a de maior **acurácia balanceada** (sensibilidade e especificidade juntas), numa grade mais ampla, sem retreinar os modelos ([Comum/README.md](Comum/README.md#2º-experimento-regra-escolhida-pela-acurácia-balanceada)).
 5. **Avisos por episódio**: um aviso quando o alarme começa; novo aviso só depois de 6 h de recuperação.
 6. **Métricas por evento**: *sensibilidade* (falha com aviso novo dentro da janela anotada), *especificidade* (evento normal sem nenhum aviso), precisão e avisos falsos por 30 dias. Os supervisionados também reportam MAE, RMSE e R² da regressão em dados normais não vistos.
 
@@ -114,6 +114,8 @@ Critério experimental definido pelo grupo para aceitar um detector: **sensibili
 | Avisos falsos por 30 dias normais | 5,03 |
 
 O K-means detecta boa parte das falhas, mas avisa em quase todos os eventos normais e não atinge o critério de aceite. Isso motivou os modelos de comportamento normal, que comparam cada sensor com o valor esperado para as condições do momento, em vez de comparar a turbina inteira com protótipos.
+
+**Escolha da regra de alerta:** com o critério de maior sensibilidade, a especificidade ficou entre 6,7% e 20% em todos os modelos. O orçamento de 5 avisos falsos por 30 dias, somado aos ~19 dias monitorados de cada evento normal, faz quase todo evento normal receber algum aviso. Por isso o 2º experimento escolhe a regra pela acurácia balanceada; veja [Comum/README.md](Comum/README.md#2º-experimento-regra-escolhida-pela-acurácia-balanceada).
 
 **Árvore de Decisão, Ensembles e SVM:** o código está pronto e testado, e a execução nos 95 eventos reais está em andamento. Ao terminar, a comparação completa (incluindo o K-means) fica em `Comum/outputs/principal/COMPARACAO.md` e `comparacao.png`, e cada modelo ganha seu `RESULTADOS.md`. Para explorar evento a evento, use o painel:
 
@@ -151,7 +153,11 @@ python -m venv .venv
 # 3. Árvore, Ensembles, SVM e Regressão Linear (retomável; ajuste --jobs aos núcleos livres)
 ./.venv/Scripts/python.exe Comum/src/treinar_modelos.py --jobs 4
 
-# 4. Painel
+# 4. 2º experimento: regra pela acurácia balanceada, sem retreinar (minutos)
+./.venv/Scripts/python.exe K-means/src/tune_detection.py --max-false-per-30-days 5 --criterion balanced --grid wide --output-dir K-means/outputs/detection_acuracia_balanceada
+./.venv/Scripts/python.exe Comum/src/treinar_modelos.py --reusar principal --run acuracia_balanceada --criterio acuracia-balanceada --grade ampla --kmeans-run detection_acuracia_balanceada
+
+# 5. Painel
 ./.venv/Scripts/python.exe -m streamlit run app_streamlit.py
 ```
 

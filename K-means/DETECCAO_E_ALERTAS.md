@@ -80,6 +80,16 @@ Os 95 modelos e suas previsões foram salvos. O [relatório do perfil de detecç
 
 As taxas mensais são normalizações dos registros monitorados nos arquivos avaliados. Não garantem uma frequência mensal numa turbina real. Não se une a cronologia entre arquivos anonimizados. O mecanismo agrupa avisos, mas não garante detectar todas as falhas nem prevê a data exata de uma falha.
 
+## 2º experimento: escolher pela acurácia balanceada
+
+Com o critério acima, a especificidade não entra na escolha: 14 dos 15 eventos normais reservados receberam aviso. O 2º experimento reaproveita os mesmos modelos e muda só a escolha da regra. Ela passa a ser a de maior acurácia balanceada por evento ((sensibilidade + especificidade) / 2) nos 65 eventos de desenvolvimento, com o mesmo teto de avisos falsos, numa grade de 75 regras que inclui P99, janelas de 48/72 h e fração de 50%. A regra continua sendo congelada antes dos reservados.
+
+```powershell
+& ./.venv/Scripts/python.exe K-means/src/tune_detection.py --max-false-per-30-days 5 --criterion balanced --grid wide --output-dir K-means/outputs/detection_acuracia_balanceada
+```
+
+Sem `--criterion` e `--grid`, o comando reproduz exatamente os experimentos anteriores.
+
 ## Verificação
 
 ```powershell
